@@ -1,0 +1,277 @@
+import pandas as pd
+import cloudscraper
+from bs4 import BeautifulSoup
+import time
+import random
+import os
+import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import resource
+
+# Augmentation limite fichiers (macOS Fix)
+try:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+except Exception:
+    pass
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- CONFIGURATION ---
+INPUT_FILE = 'input.csv'
+OUTPUT_FILE = 'output_artnet_smart.csv'
+RETRY_FILE = 'artists_to_retry.csv'
+FICHIER_ETAT = 'last_position.txt'
+SEP = ','
+
+# 🧠 MODE INTELLIGENT (Rythme cassé) 🧠
+MAX_WORKERS = 2       # 2 Fenêtres (Bon compromis vitesse/discrétion)
+BATCH_SIZE = 20       # Sauvegarde fréquente
+
+# REPRISE MANUELLE (Sera écrasée par le fichier de sauvegarde)
+FORCE_START_INDEX = 0 
+
+# --- GESTION DE LA SAUVEGARDE ---
+def charger_progression():
+    if os.path.exists(FICHIER_ETAT):
+        with open(FICHIER_ETAT, "r") as f:
+            try:
+                valeur = int(f.read().strip())
+                print(f"🔄 Reprise détectée à l'index : {valeur}")
+                return valeur
+            except ValueError:
+                return 0
+    return 0
+
+def sauvegarder_progression(index):
+    with open(FICHIER_ETAT, "w") as f:
+        f.write(str(index))
+
+# --- STOCKAGE LOCAL ---
+thread_local = threading.local()
+
+def get_thread_scraper():
+    # On crée une session unique par thread pour garder les cookies (plus humain)
+    if not hasattr(thread_local, "scraper"):
+        # On varie les plateformes pour brouiller les pistes
+        platform = random.choice(['darwin', 'windows', 'linux'])
+        browser = random.choice(['chrome', 'firefox'])
+        thread_local.scraper = cloudscraper.create_scraper(
+            browser={'browser': browser, 'platform': platform, 'desktop': True}
+        )
+    return thread_local.scraper
+
+def get_soup(scraper, url):
+    try:
+        # Timeout aléatoire pour ne pas avoir une signature temporelle fixe
+        r = scraper.get(url, timeout=random.randint(15, 30))
+        
+        # Détection des blocages
+        if r.status_code == 403 or "security" in r.text.lower() or "challenge" in r.text.lower():
+            return "BLOCK"
+            
+        if r.status_code == 200:
+            return BeautifulSoup(r.text, 'html.parser')
+    except Exception:
+        pass
+    return None
+
+def process_single_artist(row_data):
+    index, row = row_data
+    url = row.get('url_col')
+    
+    result = {
+        'index': index,
+        'Scrap_Auctions': "", 
+        'Scrap_Objects': "", 
+        'Scrap_Timeline': "",
+        'status_code': "OK"
+    }
+
+    if not isinstance(url, str) or "http" not in url:
+        return result
+
+    url = url.rstrip('/')
+    scraper = get_thread_scraper()
+
+    # --- 🎲 GESTION DU RYTHME (C'est ici que tout se joue) ---
+    
+    # 1. Délai de base très variable (0.5s à 3.5s)
+    time.sleep(random.uniform(0.5, 3.5))
+
+    # 2. Micro-Pause aléatoire (5% de chance de faire une pause "café" de 10s)
+    # Cela casse le pattern de robot qui ne s'arrête jamais
+    if random.random() < 0.05:
+        time.sleep(random.uniform(8.0, 15.0))
+
+    # --- 1. PAGE PRINCIPALE ---
+    soup = get_soup(scraper, url)
+    
+    if soup == "BLOCK":
+        result['status_code'] = "BLOCK"
+        return result
+        
+    if soup:
+        if not soup.find('h1'): # Sécurité structure
+            result['status_code'] = "BLOCK"
+            return result
+
+        # Auctions
+        node = soup.find(lambda t: t.name in ['button', 'a'] and "Auction Results" in t.get_text())
+        if node:
+            txt = node.get_text(strip=True)
+            if "(" in txt: 
+                val = txt.split('(')[1].split(')')[0]
+                result['Scrap_Auctions'] = val
+        
+        # Objects
+        ul = soup.find('ul', id='facets-type')
+        if ul:
+            result['Scrap_Objects'] = " | ".join([b.get_text(strip=True) for b in ul.find_all('button', class_='facet')])
+    
+    # --- 2. PAGE BIOGRAPHIE ---
+    # Petite pause avant de charger la 2ème page du même artiste
+    time.sleep(random.uniform(0.5, 1.5))
+    
+    soup_bio = get_soup(scraper, url + "/biography")
+    if soup_bio == "BLOCK":
+         pass # On ignore si la bio bloque, tant pis, on garde le reste
+    elif soup_bio:
+        dl = soup_bio.find('dl', class_='exhibitionsList')
+        if dl:
+            entries = []
+            for dt, dd in zip(dl.find_all('dt'), dl.find_all('dd')):
+                annee = dt.get_text(strip=True)
+                desc = dd.get_text(strip=True)
+                entries.append(f"{annee}: {desc}" if annee else desc)
+            result['Scrap_Timeline'] = " | ".join(entries)
+
+    return result
+
+# --- EXÉCUTION ---
+if __name__ == "__main__":
+    print("Chargement des données...")
+
+    try:
+        df_input = pd.read_csv(INPUT_FILE, sep=SEP, header=0, dtype=str, keep_default_na=False, on_bad_lines='skip')
+    except:
+        print(f"Erreur: {INPUT_FILE} introuvable.")
+        exit()
+
+    url_col_name = next((c for c in df_input.columns if df_input[c].astype(str).str.contains('http').any()), None)
+    
+    if not url_col_name:
+        print("Erreur: Colonne URL non trouvée.")
+        exit()
+
+    # --- REPRISE ---
+    saved_index = charger_progression()
+    START_INDEX = max(FORCE_START_INDEX, saved_index)
+
+    if START_INDEX > 0:
+        print(f"⏩ Démarrage à l'index {START_INDEX}.")
+        df_to_do = df_input.iloc[START_INDEX:].copy()
+    else:
+        df_to_do = df_input.copy()
+
+    # Filtre déjà faits
+    processed_urls = set()
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            df_done = pd.read_csv(OUTPUT_FILE, sep=',', usecols=[url_col_name], dtype=str, keep_default_na=False)
+            processed_urls = set(df_done[url_col_name].astype(str))
+        except: pass
+
+    df_to_do = df_to_do[~df_to_do[url_col_name].astype(str).isin(processed_urls)].copy()
+    
+    total_remaining = len(df_to_do)
+    print(f"--> Il reste {total_remaining} artistes à scraper.")
+
+    if total_remaining == 0:
+        print("Tout est fini.")
+        exit()
+
+    tasks = []
+    for index, row in df_to_do.iterrows():
+        row_dict = row.to_dict()
+        row_dict['url_col'] = row[url_col_name]
+        tasks.append((index, row_dict))
+
+    print(f"🚀 Démarrage MODE INTELLIGENT (2 Threads + Jitter + Micro-Pauses)...")
+    
+    write_header = not os.path.exists(OUTPUT_FILE)
+    write_retry_header = not os.path.exists(RETRY_FILE)
+    
+    results_buffer = []
+    consecutive_blocks = 0
+    total_ok_session = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for i in range(0, len(tasks), BATCH_SIZE):
+            chunk = tasks[i : i + BATCH_SIZE]
+            futures = {executor.submit(process_single_artist, task): task for task in chunk}
+            
+            for future in as_completed(futures):
+                res = future.result()
+                idx = res['index']
+                original_row = df_input.loc[idx].copy()
+                
+                # BLOCAGE
+                if res['status_code'] == "BLOCK":
+                    consecutive_blocks += 1
+                    print(f"⚠️ BLOQUÉ sur l'artiste {idx}")
+                    
+                    pd.DataFrame([original_row]).to_csv(RETRY_FILE, mode='a', header=write_retry_header, index=False, sep=',')
+                    write_retry_header = False
+
+                    if consecutive_blocks >= 20:
+                        print(f"\n🛑 STOP : 20 blocages d'affilée.")
+                        print("✈️  Pause avion nécessaire !")
+                        print(f"💾 Sauvegarde de la position : {idx}")
+                        sauvegarder_progression(idx)
+                        os._exit(1)
+                
+                # SUCCÈS
+                else:
+                    consecutive_blocks = 0 # Reset du compteur de blocage
+                    total_ok_session += 1
+                    
+                    auctions = res['Scrap_Auctions']
+                    objects = res['Scrap_Objects']
+                    
+                    has_real_auction = (auctions and auctions != "0")
+                    has_objects = (objects and len(objects) > 0)
+
+                    # Affichage conditionnel pour ne pas polluer la console
+                    if has_real_auction or has_objects:
+                         print(f"[{idx}] OK -> Auctions: {auctions}")
+                    else:
+                         print(f".", end="", flush=True)
+
+                    original_row['Scrap_Auctions'] = auctions
+                    original_row['Scrap_Objects'] = objects
+                    original_row['Scrap_Timeline'] = res['Scrap_Timeline']
+                    results_buffer.append(original_row)
+
+            # Sauvegarde régulière (CSV)
+            if results_buffer:
+                pd.DataFrame(results_buffer).to_csv(OUTPUT_FILE, mode='a', header=write_header, index=False, sep=',')
+                write_header = False
+                results_buffer = []
+                print(f" [Save]") # Petit indicateur visuel
+                
+                # Sauvegarde progression
+                try:
+                    last_idx = chunk[-1][0]
+                    sauvegarder_progression(last_idx)
+                except: pass
+                
+            # --- PAUSE DE GROUPE ---
+            # Une fois le batch de 20 fini, on ajoute parfois une mini pause pour laisser le serveur respirer
+            # C'est très efficace pour éviter le ban IP
+            if random.random() < 0.3: # 30% de chance à la fin d'un batch
+                # print(" (Cool down...)") 
+                time.sleep(random.uniform(2.0, 5.0))
+
+    print("\nTerminé !")
